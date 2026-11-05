@@ -15,16 +15,52 @@ working_dir="$PWD"
 mkdir -p $PWD/output
 outputdir=$PWD/output
 if [ "$EUID" -eq 0 ]; then
-  ORIGINAL_USERNAME=$(logname)
-  ORIGINAL_GROUP=$(id -gn "$ORIGINAL_USERNAME")
+  ORIGINAL_USERNAME=$(logname 2>/dev/null) || ORIGINAL_USERNAME=""
+  ORIGINAL_GROUP=$(id -gn "$ORIGINAL_USERNAME" 2>/dev/null) || ORIGINAL_GROUP=""
   chown "$ORIGINAL_USERNAME:$ORIGINAL_GROUP" "$outputdir" -R
 else
 	chown $(id -u):$(id -g) "$outputdir" -R
 fi
 
-date >> $outputdir/${HOSTNAME}_os_process_pidstat.perf
+# Use -H on newer sysstat (11.5+) so timestamps are always displayed in seconds since the epoch.
+PIDSTAT_OPTS="-d -h -I -u -w -r"
+if pidstat -H 1 1 >/dev/null 2>&1; then
+    PIDSTAT_OPTS="-d -H -h -I -u -w -r"
+fi
 
-LC_TIME=en_US.UTF-8 pidstat -d -h -I -u -w -r $OS_COUNTERS_INTERVAL >> $outputdir/${HOSTNAME}_os_process_pidstat.perf &
+# Do not prepend 'date' before pidstat output (SQL Nexus LinuxPerfImporter expects the '# Time...'
+# header at line index 2), and normalize the metric columns to the 16 columns expected by SQL Nexus
+# across sysstat 10.x (RHEL 7), 11.2.x (Ubuntu 16.04), and 11.5+ (RHEL 8/9).
+LC_TIME=en_US.UTF-8 pidstat $PIDSTAT_OPTS $OS_COUNTERS_INTERVAL > >(awk '
+BEGIN {
+    split("%usr %system %guest %CPU CPU minflt/s majflt/s VSZ RSS %MEM kB_rd/s kB_wr/s kB_ccwr/s iodelay cswch/s nvcswch/s", target_cols, " ")
+}
+/^#/ {
+    delete col_map
+    for (i = 5; i < NF; i++) {
+        col_map[$i] = i - 1
+    }
+    print "#      Time   UID       PID    %usr %system  %guest    %CPU   CPU  minflt/s  majflt/s     VSZ     RSS   %MEM   kB_rd/s   kB_wr/s kB_ccwr/s iodelay   cswch/s nvcswch/s  Command"
+    fflush()
+    next
+}
+/^ *[0-9]/ {
+    printf " %10s %5s %9s", $1, $2, $3
+    for (m = 1; m <= 16; m++) {
+        cname = target_cols[m]
+        idx = col_map[cname]
+        val = (idx > 0 && idx < NF) ? $idx : (cname == "iodelay" ? "0" : "0.00")
+        printf " %7s", val
+    }
+    printf "  %s\n", $NF
+    fflush()
+    next
+}
+{
+    print
+    fflush()
+}
+' > "$outputdir/${HOSTNAME}_os_process_pidstat.perf") &
 printf "%s\n" "$!" >> $outputdir/pssdiag_stoppids_os_collectors.log
 
 exit 0
